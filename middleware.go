@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -24,7 +25,6 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/purell"
-	"github.com/gambol99/go-oidc/jose"
 	"github.com/go-chi/chi/middleware"
 	uuid "github.com/satori/go.uuid"
 	"github.com/unrolled/secure"
@@ -127,7 +127,7 @@ func (r *oauthProxy) authenticationMiddleware(resource *Resource) func(http.Hand
 					return
 				}
 			} else {
-				if err := verifyToken(r.client, user.token); err != nil {
+				if _, err := verifyToken(ctx, r.getVerifier(), user.token); err != nil {
 					// step: if the error post verification is anything other than a token
 					// expired error we immediately throw an access forbidden - as there is
 					// something messed up in the token
@@ -168,7 +168,8 @@ func (r *oauthProxy) authenticationMiddleware(resource *Resource) func(http.Hand
 					}
 
 					// attempt to refresh the access token
-					token, exp, err := getRefreshedToken(r.client, refresh)
+					oauthCfg := r.getOAuthConfig(r.getRedirectionURL(w, req))
+					rawToken, _, err := getRefreshedToken(oauthCfg, r.getVerifier(), ctx, refresh)
 					if err != nil {
 						switch err {
 						case ErrRefreshTokenExpired:
@@ -185,15 +186,15 @@ func (r *oauthProxy) authenticationMiddleware(resource *Resource) func(http.Hand
 						return
 					}
 					// get the expiration of the new access token
-					expiresIn := r.getAccessCookieExpiration(token, refresh)
+					expiresIn := r.getAccessCookieExpiration(ctx, refresh)
 
 					r.log.Info("injecting the refreshed access token cookie",
 						zap.String("client_ip", clientIP),
 						zap.String("cookie_name", r.config.CookieAccessName),
 						zap.String("email", user.email),
-						zap.Duration("expires_in", time.Until(exp)))
+						zap.Duration("expires_in", expiresIn))
 
-					accessToken := token.Encode()
+					accessToken := rawToken
 					if r.config.EnableEncryptedToken {
 						if accessToken, err = encodeText(accessToken, r.config.EncryptionKey); err != nil {
 							r.log.Error("unable to encode the access token", zap.Error(err))
@@ -205,7 +206,7 @@ func (r *oauthProxy) authenticationMiddleware(resource *Resource) func(http.Hand
 					r.dropAccessTokenCookie(req.WithContext(ctx), w, accessToken, expiresIn)
 
 					if r.useStore() {
-						go func(old, new jose.JWT, encrypted string) {
+						go func(old, new string, encrypted string) {
 							if err := r.DeleteRefreshToken(old); err != nil {
 								r.log.Error("failed to remove old token", zap.Error(err))
 							}
@@ -213,10 +214,10 @@ func (r *oauthProxy) authenticationMiddleware(resource *Resource) func(http.Hand
 								r.log.Error("failed to store refresh token", zap.Error(err))
 								return
 							}
-						}(user.token, token, encrypted)
+						}(user.token, accessToken, encrypted)
 					}
 					// update the with the new access token and inject into the context
-					user.token = token
+					user.token = accessToken
 					ctx = context.WithValue(req.Context(), contextScopeName, scope)
 				}
 			}
@@ -241,24 +242,24 @@ func (r *oauthProxy) checkClaim(user *userContext, claimName string, match *rege
 	}
 
 	// Check string claim.
-	valueStr, foundStr, errStr := user.claims.StringClaim(claimName)
-	// We have found string claim, so let's check whether it matches.
-	if foundStr {
+	var valueStr string
+	errStr := json.Unmarshal(user.claims[claimName], &valueStr)
+	if errStr == nil {
 		if match.MatchString(valueStr) {
 			return true
+		} else {
+			r.log.Warn("claim requirement does not match claim in token", append(errFields,
+				zap.String("issued", valueStr),
+				zap.String("required", match.String()),
+			)...)
+			return false
 		}
-		r.log.Warn("claim requirement does not match claim in token", append(errFields,
-			zap.String("issued", valueStr),
-			zap.String("required", match.String()),
-		)...)
-
-		return false
 	}
 
 	// Check strings claim.
-	valueStrs, foundStrs, errStrs := user.claims.StringsClaim(claimName)
-	// We have found strings claim, so let's check whether it matches.
-	if foundStrs {
+	var valueStrs []string
+	errStrs := json.Unmarshal(user.claims[claimName], &valueStrs)
+	if errStrs == nil {
 		for _, value := range valueStrs {
 			if match.MatchString(value) {
 				return true
@@ -268,7 +269,6 @@ func (r *oauthProxy) checkClaim(user *userContext, claimName string, match *rege
 			zap.String("issued", fmt.Sprintf("%v", valueStrs)),
 			zap.String("required", match.String()),
 		)...)
-
 		return false
 	}
 
@@ -378,17 +378,17 @@ func (r *oauthProxy) identityHeadersMiddleware(custom []string) func(http.Handle
 				req.Header.Set("X-Auth-ExpiresIn", user.expiresAt.String())
 				req.Header.Set("X-Auth-Groups", strings.Join(user.groups, ","))
 				req.Header.Set("X-Auth-Roles", strings.Join(user.roles, ","))
-				req.Header.Set("X-Auth-Subject", user.id)
+				req.Header.Set("X-Auth-Subject", user.subject)
 				req.Header.Set("X-Auth-Userid", user.name)
 				req.Header.Set("X-Auth-Username", user.name)
 
 				// should we add the token header?
 				if r.config.EnableTokenHeader {
-					req.Header.Set("X-Auth-Token", user.token.Encode())
+					req.Header.Set("X-Auth-Token", user.token)
 				}
 				// add the authorization header if requested
 				if r.config.EnableAuthorizationHeader {
-					req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", user.token.Encode()))
+					req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", user.token))
 				}
 				// are we filtering out the cookies
 				if !r.config.EnableAuthorizationCookies {

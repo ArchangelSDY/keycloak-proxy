@@ -16,82 +16,75 @@ limitations under the License.
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/gambol99/go-oidc/jose"
-	"github.com/gambol99/go-oidc/oidc"
+	"github.com/coreos/go-oidc"
 )
 
 // extractIdentity parse the jwt token and extracts the various elements is order to construct
-func extractIdentity(token jose.JWT) (*userContext, error) {
-	claims, err := token.Claims()
-	if err != nil {
+func extractIdentity(token *oidc.IDToken) (*userContext, error) {
+	var claims map[string]json.RawMessage
+	if err := token.Claims(&claims); err != nil {
 		return nil, err
 	}
-	identity, err := oidc.IdentityFromClaims(claims)
-	if err != nil {
-		return nil, err
+
+	var email string
+	if val, ok := claims[claimEmail]; ok {
+		json.Unmarshal(val, &email)
 	}
 
 	// @step: ensure we have and can extract the preferred name of the user, if not, we set to the ID
-	preferredName, found, err := claims.StringClaim(claimPreferredName)
-	if err != nil || !found {
-		preferredName = identity.Email
-	}
-
-	var audiences []string
-	aud, found, err := claims.StringClaim(claimAudience)
-	if err == nil && found {
-		audiences = append(audiences, aud)
-	} else {
-		if aud, found, err := claims.StringsClaim(claimAudience); err != nil || !found {
-			return nil, ErrNoTokenAudience
-		} else {
-			audiences = aud
+	var preferredName string
+	if val, ok := claims[claimPreferredName]; ok {
+		if err := json.Unmarshal(val, &preferredName); err != nil {
+			preferredName = email
 		}
 	}
 
 	// @step: extract the realm roles
 	var roleList []string
-	if realmRoles, found := claims[claimRealmAccess].(map[string]interface{}); found {
-		if roles, found := realmRoles[claimResourceRoles]; found {
-			for _, r := range roles.([]interface{}) {
-				roleList = append(roleList, fmt.Sprintf("%s", r))
+	if val, ok := claims[claimRealmAccess]; ok {
+		var realmRoles map[string][]string
+		if err := json.Unmarshal(val, &realmRoles); err == nil {
+			if roles, ok := realmRoles[claimRealmAccess]; ok {
+				roleList = append(roleList, roles...)
 			}
 		}
 	}
 
 	// @step: extract the client roles from the access token
-	if accesses, found := claims[claimResourceAccess].(map[string]interface{}); found {
-		for name, list := range accesses {
-			scopes := list.(map[string]interface{})
-			if roles, found := scopes[claimResourceRoles]; found {
-				for _, r := range roles.([]interface{}) {
-					roleList = append(roleList, fmt.Sprintf("%s:%s", name, r))
+	if val, ok := claims[claimResourceAccess]; ok {
+		var accesses map[string]map[string][]string
+		if err := json.Unmarshal(val, &accesses); err == nil {
+			for name, scopes := range accesses {
+				if roles, found := scopes[claimResourceRoles]; found {
+					for _, r := range roles {
+						roleList = append(roleList, fmt.Sprintf("%s:%s", name, r))
+					}
 				}
 			}
 		}
 	}
 
 	// @step: extract any group information from the tokens
-	groups, _, err := claims.StringsClaim(claimGroups)
-	if err != nil {
-		return nil, err
+	var groups []string
+	if val, ok := claims[claimGroups]; ok {
+		json.Unmarshal(val, &groups)
 	}
 
 	return &userContext{
-		audiences:     audiences,
+		audiences:     token.Audience,
 		claims:        claims,
-		email:         identity.Email,
-		expiresAt:     identity.ExpiresAt,
+		email:         email,
+		expiresAt:     token.Expiry,
 		groups:        groups,
-		id:            identity.ID,
+		subject:       token.Subject,
 		name:          preferredName,
 		preferredName: preferredName,
 		roles:         roleList,
-		token:         token,
 	}, nil
 }
 

@@ -23,7 +23,6 @@ import (
 	"path"
 	"time"
 
-	"github.com/gambol99/go-oidc/jose"
 	"go.uber.org/zap"
 )
 
@@ -114,13 +113,13 @@ func (r *oauthProxy) redirectToAuthorization(w http.ResponseWriter, req *http.Re
 }
 
 // getAccessCookieExpiration calucates the expiration of the access token cookie
-func (r *oauthProxy) getAccessCookieExpiration(token jose.JWT, refresh string) time.Duration {
+func (r *oauthProxy) getAccessCookieExpiration(ctx context.Context, refresh string) time.Duration {
 	// notes: by default the duration of the access token will be the configuration option, if
 	// however we can decode the refresh token, we will set the duration to the duraction of the
 	// refresh token
 	duration := r.config.AccessTokenDuration
-	if _, ident, err := parseToken(refresh); err == nil {
-		delta := time.Until(ident.ExpiresAt)
+	if ident, err := verifyToken(ctx, r.getVerifier(), refresh); err == nil {
+		delta := time.Until(ident.Expiry)
 		if delta > 0 {
 			duration = delta
 		}

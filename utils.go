@@ -44,7 +44,6 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/gambol99/go-oidc/jose"
 	"github.com/urfave/cli"
 	"gopkg.in/yaml.v2"
 )
@@ -451,8 +450,8 @@ func getWithin(expires time.Time, within float64) time.Duration {
 }
 
 // getHashKey returns a hash of the encodes jwt token
-func getHashKey(token *jose.JWT) string {
-	hash := sha.Sum256([]byte(token.Encode()))
+func getHashKey(token string) string {
+	hash := sha.Sum256([]byte(token))
 	return base64.RawStdEncoding.EncodeToString(hash[:])
 }
 

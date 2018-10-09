@@ -122,14 +122,14 @@ func (r *oauthProxy) oauthCallbackHandler(w http.ResponseWriter, req *http.Reque
 	var token *oidc.IDToken
 	var tokenEncoded string
 	if rawIDToken, ok := resp.Extra("id_token").(string); ok {
-		if token, err = verifyToken(r.provider, rawIDToken); err != nil {
+		if token, err = verifyToken(ctx, r.getVerifier(), rawIDToken); err != nil {
 			r.log.Error("unable to parse id token for identity", zap.Error(err))
 			r.accessForbidden(w, req)
 			return
 		}
 		tokenEncoded = resp.Extra("id_token").(string)
 	}
-	if accessToken, err := verifyToken(r.provider, resp.AccessToken); err == nil {
+	if accessToken, err := verifyToken(ctx, r.getVerifier(), resp.AccessToken); err == nil {
 		token = accessToken
 		tokenEncoded = resp.AccessToken
 	} else {
@@ -183,20 +183,20 @@ func (r *oauthProxy) oauthCallbackHandler(w http.ResponseWriter, req *http.Reque
 			return
 		}
 		// drop in the access token - cookie expiration = access token
-		r.dropAccessTokenCookie(req, w, tokenEncoded, r.getAccessCookieExpiration(token, resp.RefreshToken))
+		r.dropAccessTokenCookie(req, w, tokenEncoded, r.getAccessCookieExpiration(ctx, resp.RefreshToken))
 
 		switch r.useStore() {
 		case true:
-			if err = r.StoreRefreshToken(token, encrypted); err != nil {
+			if err = r.StoreRefreshToken(resp.RefreshToken, encrypted); err != nil {
 				r.log.Warn("failed to save the refresh token in the store", zap.Error(err))
 			}
 		default:
 			// notes: not all idp refresh tokens are readable, google for example, so we attempt to decode into
 			// a jwt and if possible extract the expiration, else we default to 10 days
-			if _, ident, err := parseToken(resp.RefreshToken); err != nil {
+			if ident, err := verifyToken(ctx, r.getVerifier(), resp.RefreshToken); err != nil {
 				r.dropRefreshTokenCookie(req, w, encrypted, 0)
 			} else {
-				r.dropRefreshTokenCookie(req, w, encrypted, time.Until(ident.ExpiresAt))
+				r.dropRefreshTokenCookie(req, w, encrypted, time.Until(ident.Expiry))
 			}
 		}
 	} else {
@@ -235,15 +235,13 @@ func (r *oauthProxy) loginHandler(w http.ResponseWriter, req *http.Request) {
 			return "request does not have both username and password", http.StatusBadRequest, errors.New("no credentials")
 		}
 
-		client, err := r.client.OAuthClient()
-		if err != nil {
-			return "unable to create the oauth client for user_credentials request", http.StatusInternalServerError, err
-		}
+		oauthCfg := r.getOAuthConfig(r.getRedirectionURL(w, req))
+		ctx := context.WithValue(context.Background(), oauth2.HTTPClient, r.idpClient)
 
 		start := time.Now()
-		token, err := client.UserCredsToken(username, password)
+		token, err := oauthCfg.PasswordCredentialsToken(ctx, username, password)
 		if err != nil {
-			if strings.HasPrefix(err.Error(), oauth2.ErrorInvalidGrant) {
+			if strings.HasPrefix(err.Error(), "invalid_grant") {
 				return "invalid user credentials provided", http.StatusUnauthorized, err
 			}
 			return "unable to request the access token via grant_type 'password'", http.StatusInternalServerError, err
@@ -251,7 +249,7 @@ func (r *oauthProxy) loginHandler(w http.ResponseWriter, req *http.Request) {
 		// @metric observe the time taken for a login request
 		oauthLatencyMetric.WithLabelValues("login").Observe(time.Since(start).Seconds())
 
-		idToken, err := verifyToken(token.AccessToken)
+		idToken, err := verifyToken(ctx, r.getVerifier(), token.AccessToken)
 		if err != nil {
 			return "unable to decode the access token", http.StatusNotImplemented, err
 		}
@@ -263,11 +261,11 @@ func (r *oauthProxy) loginHandler(w http.ResponseWriter, req *http.Request) {
 
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(tokenResponse{
-			IDToken:      token.IDToken,
+			IDToken:      token.Extra("id_token").(string),
 			AccessToken:  token.AccessToken,
 			RefreshToken: token.RefreshToken,
-			ExpiresIn:    token.Expires,
-			Scope:        token.Scope,
+			ExpiresIn:    token.Extra("expires_in").(int),
+			Scope:        token.Extra("scope").(string),
 		}); err != nil {
 			return "", http.StatusInternalServerError, err
 		}
@@ -311,7 +309,7 @@ func (r *oauthProxy) logoutHandler(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// step: can either use the id token or the refresh token
-	identityToken := user.token.Encode()
+	identityToken := user.token
 	if refresh, _, err := r.retrieveRefreshToken(req, user); err == nil {
 		identityToken = refresh
 	}
@@ -358,13 +356,6 @@ func (r *oauthProxy) logoutHandler(w http.ResponseWriter, req *http.Request) {
 
 	// step: do we have a revocation endpoint?
 	if revocationURL != "" {
-		client, err := r.client.OAuthClient()
-		if err != nil {
-			r.log.Error("unable to retrieve the openid client", zap.Error(err))
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-
 		// step: add the authentication headers
 		encodedID := url.QueryEscape(r.config.ClientID)
 		encodedSecret := url.QueryEscape(r.config.ClientSecret)
@@ -382,7 +373,7 @@ func (r *oauthProxy) logoutHandler(w http.ResponseWriter, req *http.Request) {
 		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 		start := time.Now()
-		response, err := client.HttpClient().Do(request)
+		response, err := r.idpClient.Do(request)
 		if err != nil {
 			r.log.Error("unable to post to revocation endpoint", zap.Error(err))
 			return
@@ -429,7 +420,7 @@ func (r *oauthProxy) tokenHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(user.token.Payload)
+	w.Write([]byte(user.token))
 }
 
 // healthHandler is a health check handler for the service

@@ -16,13 +16,13 @@ limitations under the License.
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/gambol99/go-oidc/jose"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -57,6 +57,7 @@ const (
 	debugURL         = "/debug/pprof"
 
 	claimAudience       = "aud"
+	claimEmail          = "email"
 	claimPreferredName  = "preferred_username"
 	claimRealmAccess    = "realm_access"
 	claimResourceAccess = "resource_access"
@@ -391,13 +392,13 @@ type reverseProxy interface {
 // userContext holds the information extracted the token
 type userContext struct {
 	// the id of the user
-	id string
+	subject string
 	// the audience for the token
 	audiences []string
 	// whether the context is from a session cookie or authorization header
 	bearerToken bool
 	// the claims associated to the token
-	claims jose.Claims
+	claims map[string]json.RawMessage
 	// the email associated to the user
 	email string
 	// the expiration of the access token
@@ -411,7 +412,7 @@ type userContext struct {
 	// roles is a collection of roles the users holds
 	roles []string
 	// the access token itself
-	token jose.JWT
+	token string
 }
 
 // tokenResponse

@@ -17,12 +17,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
 
-	"github.com/gambol99/go-oidc/jose"
 	"go.uber.org/zap"
+	"golang.org/x/oauth2"
 )
 
 // getIdentity retrieves the user identity from a request, either from a session cookie or a bearer token
@@ -38,7 +39,9 @@ func (r *oauthProxy) getIdentity(req *http.Request) (*userContext, error) {
 			return nil, ErrDecryption
 		}
 	}
-	token, err := jose.ParseJWT(access)
+
+	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, r.idpClient)
+	token, err := verifyToken(ctx, r.getVerifier(), access)
 	if err != nil {
 		return nil, err
 	}
@@ -46,10 +49,11 @@ func (r *oauthProxy) getIdentity(req *http.Request) (*userContext, error) {
 	if err != nil {
 		return nil, err
 	}
+	user.token = access
 	user.bearerToken = isBearer
 
 	r.log.Debug("found the user identity",
-		zap.String("id", user.id),
+		zap.String("subject", user.subject),
 		zap.String("name", user.name),
 		zap.String("email", user.email),
 		zap.String("roles", strings.Join(user.roles, ",")))
