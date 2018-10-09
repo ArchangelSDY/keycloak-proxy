@@ -37,7 +37,7 @@ import (
 	httplog "log"
 
 	proxyproto "github.com/armon/go-proxyproto"
-	"github.com/gambol99/go-oidc/oidc"
+	"github.com/coreos/go-oidc"
 	"github.com/gambol99/goproxy"
 	"github.com/pressly/chi"
 	"github.com/pressly/chi/middleware"
@@ -47,10 +47,9 @@ import (
 )
 
 type oauthProxy struct {
-	client         *oidc.Client
+	provider       *oidc.Provider
 	config         *Config
 	endpoint       *url.URL
-	idp            oidc.ProviderConfig
 	idpClient      *http.Client
 	listener       net.Listener
 	log            *zap.Logger
@@ -101,7 +100,7 @@ func newProxy(config *Config) (*oauthProxy, error) {
 
 	// initialize the openid client
 	if !config.SkipTokenVerification {
-		if svc.client, svc.idp, svc.idpClient, err = svc.newOpenIDClient(); err != nil {
+		if svc.client, svc.idp, svc.idpClient, err = svc.newOpenIDProvider(); err != nil {
 			return nil, err
 		}
 	} else {
@@ -642,11 +641,11 @@ func (r *oauthProxy) createTemplates() error {
 	return nil
 }
 
-// newOpenIDClient initializes the openID configuration, note: the redirection url is deliberately left blank
+// newOpenIDProvider initializes the openID configuration, note: the redirection url is deliberately left blank
 // in order to retrieve it from the host header on request
-func (r *oauthProxy) newOpenIDClient() (*oidc.Client, oidc.ProviderConfig, *http.Client, error) {
+func (r *oauthProxy) newOpenIDProvider() (*oidc.Provider, oidc.Config, *http.Client, error) {
 	var err error
-	var config oidc.ProviderConfig
+	var config oidc.Config
 
 	// step: fix up the url if required, the underlining lib will add the .well-known/openid-configuration to the discovery url for us.
 	if strings.HasSuffix(r.config.DiscoveryURL, "/.well-known/openid-configuration") {
@@ -698,22 +697,23 @@ func (r *oauthProxy) newOpenIDClient() (*oidc.Client, oidc.ProviderConfig, *http
 		r.log.Info("successfully retrieved openid configuration from the discovery")
 	}
 
-	client, err := oidc.NewClient(oidc.ClientConfig{
-		Credentials: oidc.ClientCredentials{
-			ID:     r.config.ClientID,
-			Secret: r.config.ClientSecret,
-		},
-		HTTPClient:        hc,
-		RedirectURL:       fmt.Sprintf("%s/oauth/callback", r.config.RedirectionURL),
-		ProviderConfig:    config,
-		Scope:             append(r.config.Scopes, oidc.DefaultScope...),
-		SkipClientIDCheck: r.config.SkipClientID,
-	})
+	ctx := oidc.ClientContext(context.Background(), hc)
+	provider, err := oidc.NewProvider(ctx, r.config.DiscoveryURL)
 	if err != nil {
 		return nil, config, hc, err
 	}
+
+	cfg := oidc.ClientConfig{
+		ClientID: r.config.ClientID,
+		// TODO
+		// RedirectURL:       fmt.Sprintf("%s/oauth/callback", r.config.RedirectionURL),
+		// ProviderConfig:    config,
+		// Scope:             append(r.config.Scopes, oidc.DefaultScope...),
+		SkipClientIDCheck: r.config.SkipClientID,
+	}
+	// TODO
 	// start the provider sync for key rotation
-	client.SyncProviderConfig(r.config.DiscoveryURL)
+	// client.SyncProviderConfig(r.config.DiscoveryURL)
 
 	return client, config, hc, nil
 }

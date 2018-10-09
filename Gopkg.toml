@@ -49,6 +49,10 @@
   branch = "master"
   name = "github.com/urfave/cli"
 
+[[constraint]]
+  branch = "v2"
+  name = "github.com/coreos/go-oidc"
+
 [prune]
   go-tests = true
   unused-packages = true

@@ -16,6 +16,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,45 +25,51 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gambol99/go-oidc/jose"
-	"github.com/gambol99/go-oidc/oauth2"
-	"github.com/gambol99/go-oidc/oidc"
+	"github.com/coreos/go-oidc"
+	"golang.org/x/oauth2"
 )
 
-// getOAuthClient returns a oauth2 client from the openid client
-func (r *oauthProxy) getOAuthClient(redirectionURL string) (*oauth2.Client, error) {
-	return oauth2.NewClient(r.idpClient, oauth2.Config{
-		Credentials: oauth2.ClientCredentials{
-			ID:     r.config.ClientID,
-			Secret: r.config.ClientSecret,
+type OAuth2GrantType int
+
+const (
+	GrantTypeAuthCode OAuth2GrantType = iota
+	GrantTypeRefreshToken
+)
+
+// getOAuthConfig returns a oauth2 config
+func (r *oauthProxy) getOAuthConfig(redirectionURL string) *oauth2.Config {
+	return &oauth2.Config{
+		ClientID:     r.config.ClientID,
+		ClientSecret: r.config.ClientSecret,
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  r.idp.AuthEndpoint.String(),
+			TokenURL: r.idp.TokenEndpoint.String(),
 		},
-		AuthMethod:  oauth2.AuthMethodClientSecretBasic,
-		AuthURL:     r.idp.AuthEndpoint.String(),
+		// AuthMethod:  oauth2.AuthMethodClientSecretBasic,
 		RedirectURL: redirectionURL,
-		Scope:       append(r.config.Scopes, oidc.DefaultScope...),
-		TokenURL:    r.idp.TokenEndpoint.String(),
-	})
+		Scopes:      append(r.config.Scopes, oidc.DefaultScope...),
+	}
 }
 
 // verifyToken verify that the token in the user context is valid
-func verifyToken(client *oidc.Client, token jose.JWT) error {
-	if err := client.VerifyJWT(token); err != nil {
+func verifyToken(provider *oidc.Provider, rawToken string) (*oidc.IDToken, error) {
+	if token, err := provider.Verify(rawToken); err == nil {
+		return token, nil
+	} else {
 		if strings.Contains(err.Error(), "token is expired") {
-			return ErrAccessTokenExpired
+			return nil, ErrAccessTokenExpired
 		}
-		return err
+		return nil, err
 	}
-
-	return nil
 }
 
 // getRefreshedToken attempts to refresh the access token, returning the parsed token and the time it expires or a error
-func getRefreshedToken(client *oidc.Client, t string) (jose.JWT, time.Time, error) {
+func getRefreshedToken(client *oidc.Client, ctx context.Context, t string) (jose.JWT, time.Time, error) {
 	cl, err := client.OAuthClient()
 	if err != nil {
 		return jose.JWT{}, time.Time{}, err
 	}
-	response, err := getToken(cl, oauth2.GrantTypeRefreshToken, t)
+	response, err := getToken(cl, ctx, GrantTypeRefreshToken, t)
 	if err != nil {
 		if strings.Contains(err.Error(), "token expired") {
 			return jose.JWT{}, time.Time{}, ErrRefreshTokenExpired
@@ -79,8 +86,8 @@ func getRefreshedToken(client *oidc.Client, t string) (jose.JWT, time.Time, erro
 }
 
 // exchangeAuthenticationCode exchanges the authentication code with the oauth server for a access token
-func exchangeAuthenticationCode(client *oauth2.Client, code string) (oauth2.TokenResponse, error) {
-	return getToken(client, oauth2.GrantTypeAuthCode, code)
+func exchangeAuthenticationCode(cfg *oauth2.Config, ctx context.Context, code string) (oauth2.Token, error) {
+	return getToken(cft, ctx, GrantTypeAuthCode, code)
 }
 
 // getUserinfo is responsible for getting the userinfo from the IDPD
@@ -111,18 +118,18 @@ func getUserinfo(client *oauth2.Client, endpoint string, token string) (jose.Cla
 }
 
 // getToken retrieves a code from the provider, extracts and verified the token
-func getToken(client *oauth2.Client, grantType, code string) (oauth2.TokenResponse, error) {
+func getToken(cfg *oauth2.Config, ctx context.Context, grantType, code string) (oauth2.Token, error) {
 	start := time.Now()
-	token, err := client.RequestToken(grantType, code)
+	token, err := cfg.Exchange(ctx, code)
 	if err != nil {
 		return token, err
 	}
 	taken := time.Since(start).Seconds()
 	switch grantType {
-	case oauth2.GrantTypeAuthCode:
+	case GrantTypeAuthCode:
 		oauthTokensMetric.WithLabelValues("exchange").Inc()
 		oauthLatencyMetric.WithLabelValues("exchange").Observe(taken)
-	case oauth2.GrantTypeRefreshToken:
+	case GrantTypeRefreshToken:
 		oauthTokensMetric.WithLabelValues("renew").Inc()
 		oauthLatencyMetric.WithLabelValues("renew").Observe(taken)
 	}

@@ -17,6 +17,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -30,7 +31,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gambol99/go-oidc/oauth2"
+	"github.com/coreos/go-oidc"
+	"golang.org/x/oauth2"
 
 	"github.com/pressly/chi"
 	"go.uber.org/zap"
@@ -64,12 +66,7 @@ func (r *oauthProxy) oauthAuthorizationHandler(w http.ResponseWriter, req *http.
 		w.WriteHeader(http.StatusNotAcceptable)
 		return
 	}
-	client, err := r.getOAuthClient(r.getRedirectionURL(w, req))
-	if err != nil {
-		r.log.Error("failed to retrieve the oauth client for authorization", zap.Error(err))
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+	oauthCfg := r.getOAuthConfig(r.getRedirectionURL(w, req))
 
 	// step: set the access type of the session
 	var accessType string
@@ -77,7 +74,8 @@ func (r *oauthProxy) oauthAuthorizationHandler(w http.ResponseWriter, req *http.
 		accessType = "offline"
 	}
 
-	authURL := client.AuthCodeURL(req.URL.Query().Get("state"), accessType, "")
+	// authURL := oauthCfg.AuthCodeURL(req.URL.Query().Get("state"), accessType, "")
+	authURL := oauthCfg.AuthCodeURL(req.URL.Query().Get("state"))
 	r.log.Debug("incoming authorization request from client address",
 		zap.String("access_type", accessType),
 		zap.String("auth_url", authURL),
@@ -109,14 +107,9 @@ func (r *oauthProxy) oauthCallbackHandler(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	client, err := r.getOAuthClient(r.getRedirectionURL(w, req))
-	if err != nil {
-		r.log.Error("unable to create a oauth2 client", zap.Error(err))
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	resp, err := exchangeAuthenticationCode(client, code)
+	oauthCfg := r.getOAuthConfig(r.getRedirectionURL(w, req))
+	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, r.idpClient)
+	resp, err := exchangeAuthenticationCode(oauthCfg, ctx, code)
 	if err != nil {
 		r.log.Error("unable to exchange code for access token", zap.Error(err))
 		r.accessForbidden(w, req)
@@ -126,31 +119,46 @@ func (r *oauthProxy) oauthCallbackHandler(w http.ResponseWriter, req *http.Reque
 	// Flow: once we exchange the authorization code we parse the ID Token; we then check for a access token,
 	// if a access token is present and we can decode it, we use that as the session token, otherwise we default
 	// to the ID Token.
-	token, identity, err := parseToken(resp.IDToken)
-	if err != nil {
-		r.log.Error("unable to parse id token for identity", zap.Error(err))
-		r.accessForbidden(w, req)
-		return
+	var token *oidc.IDToken
+	var tokenEncoded string
+	if rawIDToken, ok := resp.Extra("id_token").(string); ok {
+		if token, err = verifyToken(r.provider, rawIDToken); err != nil {
+			r.log.Error("unable to parse id token for identity", zap.Error(err))
+			r.accessForbidden(w, req)
+			return
+		}
+		tokenEncoded = resp.Extra("id_token").(string)
 	}
-	access, id, err := parseToken(resp.AccessToken)
-	if err == nil {
-		token = access
-		identity = id
+	if accessToken, err := verifyToken(r.provider, resp.AccessToken); err == nil {
+		token = accessToken
+		tokenEncoded = resp.AccessToken
 	} else {
 		r.log.Warn("unable to parse the access token, using id token only", zap.Error(err))
 	}
 
-	// step: check the access token is valid
-	if err = verifyToken(r.client, token); err != nil {
-		r.log.Error("unable to verify the id token", zap.Error(err))
+	if token == nil {
+		r.log.Error("both ID token and access token are not valid")
 		r.accessForbidden(w, req)
 		return
 	}
-	accessToken := token.Encode()
+
+	var identity struct {
+		Email string `json:"email"`
+	}
+	if err = token.Claims(&identity); err != nil {
+		r.log.Error("unable to parse claims", zap.Error(err))
+		r.accessForbidden(w, req)
+		return
+	}
+
+	// r.log.Warn("SDY IDToken: " + idToken)
+	// r.log.Warn("SDY AccessToken: " + resp.AccessToken)
+
+	r.accessForbidden(w, req)
 
 	// step: are we encrypting the access token?
 	if r.config.EnableEncryptedToken {
-		if accessToken, err = encodeText(accessToken, r.config.EncryptionKey); err != nil {
+		if tokenEncoded, err = encodeText(tokenEncoded, r.config.EncryptionKey); err != nil {
 			r.log.Error("unable to encode the access token", zap.Error(err))
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -159,8 +167,8 @@ func (r *oauthProxy) oauthCallbackHandler(w http.ResponseWriter, req *http.Reque
 
 	r.log.Info("issuing access token for user",
 		zap.String("email", identity.Email),
-		zap.String("expires", identity.ExpiresAt.Format(time.RFC3339)),
-		zap.String("duration", time.Until(identity.ExpiresAt).String()))
+		zap.String("expires", token.Expiry.Format(time.RFC3339)),
+		zap.String("duration", time.Until(token.Expiry).String()))
 
 	// @metric a token has beeb issued
 	oauthTokensMetric.WithLabelValues("issued").Inc()
@@ -175,7 +183,7 @@ func (r *oauthProxy) oauthCallbackHandler(w http.ResponseWriter, req *http.Reque
 			return
 		}
 		// drop in the access token - cookie expiration = access token
-		r.dropAccessTokenCookie(req, w, accessToken, r.getAccessCookieExpiration(token, resp.RefreshToken))
+		r.dropAccessTokenCookie(req, w, tokenEncoded, r.getAccessCookieExpiration(token, resp.RefreshToken))
 
 		switch r.useStore() {
 		case true:
@@ -192,7 +200,7 @@ func (r *oauthProxy) oauthCallbackHandler(w http.ResponseWriter, req *http.Reque
 			}
 		}
 	} else {
-		r.dropAccessTokenCookie(req, w, accessToken, time.Until(identity.ExpiresAt))
+		r.dropAccessTokenCookie(req, w, tokenEncoded, time.Until(token.Expiry))
 	}
 
 	// step: decode the state variable
@@ -243,12 +251,12 @@ func (r *oauthProxy) loginHandler(w http.ResponseWriter, req *http.Request) {
 		// @metric observe the time taken for a login request
 		oauthLatencyMetric.WithLabelValues("login").Observe(time.Since(start).Seconds())
 
-		_, identity, err := parseToken(token.AccessToken)
+		idToken, err := verifyToken(token.AccessToken)
 		if err != nil {
 			return "unable to decode the access token", http.StatusNotImplemented, err
 		}
 
-		r.dropAccessTokenCookie(req, w, token.AccessToken, time.Until(identity.ExpiresAt))
+		r.dropAccessTokenCookie(req, w, token.AccessToken, time.Until(idToken.Expiry))
 
 		// @metric a token has been issued
 		oauthTokensMetric.WithLabelValues("login").Inc()
@@ -323,9 +331,10 @@ func (r *oauthProxy) logoutHandler(w http.ResponseWriter, req *http.Request) {
 
 	// set the default revocation url
 	revokeDefault := ""
-	if r.idp.EndSessionEndpoint != nil {
-		revokeDefault = r.idp.EndSessionEndpoint.String()
-	}
+	// TODO
+	// if r.idp.EndSessionEndpoint != nil {
+	// 	revokeDefault = r.idp.EndSessionEndpoint.String()
+	// }
 	revocationURL := defaultTo(r.config.RevocationEndpoint, revokeDefault)
 
 	// @check if we should redirect to the provider
